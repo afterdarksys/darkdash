@@ -1,10 +1,13 @@
 //! Local pin. The server cannot change the bind address, the state
-//! directory, the keys, or the settings URL.
+//! directory, the keys, the settings URL, or the fleet URL and key file.
 //!
 //! Threats: a relative path, a non-loopback bind, an HTTP settings URL, a
 //! weak or all-zero public key, or two identical signing keys must not open
 //! the console. Unknown JSON fields fail closed. The pin file itself is
-//! mode 0600, owned by this euid, and not a symlink.
+//! mode 0600, owned by this euid, and not a symlink. The fleet panel is
+//! optional: `fleet_url` and `fleet_key_file` are both present or both absent,
+//! the URL is HTTPS with no path, and the key file sits apart from every
+//! other pinned path.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +32,16 @@ struct PinFile {
     token_file: String,
     audit_file: String,
     bind: String,
+    #[serde(default)]
+    fleet_url: Option<String>,
+    #[serde(default)]
+    fleet_key_file: Option<String>,
+}
+
+/// darkapi read-only reporting source for the fleet panel.
+pub struct Fleet {
+    pub url: String,
+    pub key_file: PathBuf,
 }
 
 pub struct Pin {
@@ -40,6 +53,7 @@ pub struct Pin {
     pub token_file: PathBuf,
     pub audit_file: PathBuf,
     pub port: u16,
+    pub fleet: Option<Fleet>,
 }
 
 impl Pin {
@@ -86,6 +100,11 @@ pub fn parse_pin(text: &str) -> Result<Pin, Error> {
     {
         return Err(Error::Config("path"));
     }
+    let fleet = parse_fleet(
+        file.fleet_url,
+        file.fleet_key_file,
+        &[&break_glass_file, &state_dir, &token_file, &audit_file],
+    )?;
     Ok(Pin {
         settings_url: file.settings_url,
         server_pubkey: server,
@@ -95,7 +114,30 @@ pub fn parse_pin(text: &str) -> Result<Pin, Error> {
         token_file,
         audit_file,
         port,
+        fleet,
     })
+}
+
+fn parse_fleet(
+    url: Option<String>,
+    key_file: Option<String>,
+    others: &[&Path],
+) -> Result<Option<Fleet>, Error> {
+    let (url, key_file) = match (url, key_file) {
+        (None, None) => return Ok(None),
+        (Some(url), Some(key_file)) => (url, key_file),
+        _ => return Err(Error::Config("fleet")),
+    };
+    validate_url(&url)?;
+    let origin = url.strip_prefix("https://").ok_or(Error::Config("fleet"))?;
+    if origin.contains('/') {
+        return Err(Error::Config("fleet"));
+    }
+    let key_file = clean_abs(&key_file)?;
+    if others.iter().any(|other| crowded(&key_file, other)) {
+        return Err(Error::Config("path"));
+    }
+    Ok(Some(Fleet { url, key_file }))
 }
 
 fn crowded(left: &Path, right: &Path) -> bool {
@@ -319,5 +361,51 @@ mod tests {
             "/var/lib/darksignal/token",
         );
         assert!(parse_pin(&inside).is_err());
+    }
+
+    fn with_fleet(fields: &str) -> String {
+        let base = good();
+        format!("{},{fields}}}", &base[..base.len() - 1])
+    }
+
+    #[test]
+    fn fleet_is_optional_and_pinned() {
+        assert!(parse_pin(&good()).unwrap().fleet.is_none());
+        let pin = parse_pin(&with_fleet(
+            r#""fleet_url":"https://api.darkapi.example","fleet_key_file":"/var/lib/darkdash/fleet.key""#,
+        ))
+        .unwrap();
+        let fleet = pin.fleet.unwrap();
+        assert_eq!(fleet.url, "https://api.darkapi.example");
+        assert_eq!(fleet.key_file, PathBuf::from("/var/lib/darkdash/fleet.key"));
+    }
+
+    #[test]
+    fn rejects_bad_fleet_material() {
+        let key = r#""fleet_key_file":"/var/lib/darkdash/fleet.key""#;
+        for url in [
+            "http://api.darkapi.example",
+            "https://api.darkapi.example/v1",
+            "https://api.darkapi.example/",
+            "https://user@api.darkapi.example",
+            "https://api.darkapi.example?x=1",
+        ] {
+            let text = with_fleet(&format!(r#""fleet_url":"{url}",{key}"#));
+            assert!(parse_pin(&text).is_err(), "{url}");
+        }
+        let url_only = with_fleet(r#""fleet_url":"https://api.darkapi.example""#);
+        assert!(parse_pin(&url_only).is_err());
+        assert!(parse_pin(&with_fleet(key)).is_err());
+        for path in [
+            "relative.key",
+            "/var/lib/darkdash/token",
+            "/var/lib/darksignal/fleet.key",
+            "/var/lib/darkdash/audit",
+        ] {
+            let text = with_fleet(&format!(
+                r#""fleet_url":"https://api.darkapi.example","fleet_key_file":"{path}""#
+            ));
+            assert!(parse_pin(&text).is_err(), "{path}");
+        }
     }
 }

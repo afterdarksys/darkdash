@@ -18,6 +18,11 @@ article, section { background: #1e2218; padding: 12px; margin-bottom: 12px; }
 table { border-collapse: collapse; width: 100%; }
 td, th { text-align: left; padding: 4px 8px; vertical-align: top; }
 tr.breach { color: #d24a3a; }
+#fleet-hosts { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+#fleet-hosts article { margin: 0; }
+.host-online { border-left: 4px solid #7d9a62; }
+.host-stale, .host-clock_skew { border-left: 4px solid #e0a100; }
+.host-silent, .host-never { border-left: 4px solid #d24a3a; }
 #legend i { display: inline-block; width: 12px; height: 12px; margin-right: 6px; }
 #legend span { margin-right: 12px; }
 svg { width: 100%; height: auto; background: #14160f; }
@@ -57,10 +62,20 @@ button, input { font: inherit; color: inherit; background: #14160f; border: 1px 
     </section>
     <section id="legend"></section>
     <section id="recent" class="scroll"></section>
+    <section id="fleet" hidden>
+      <h2>Fleet (darkapi)</h2>
+      <p id="fleet-status" class="muted"></p>
+      <section id="fleet-hosts"></section>
+      <h2>Open signals</h2>
+      <section id="fleet-signals" class="scroll"></section>
+      <h2>Rejected reports</h2>
+      <section id="fleet-rejections" class="scroll"></section>
+    </section>
     <section id="notes" class="muted">
       <p>Afterzero counts are pack conditions met, not confirmation of exploitation.</p>
       <p>nocved is the sensor; nocve-store is the forwarder.</p>
       <p>darksignal is the local bus, not a counted producer.</p>
+      <p>The fleet panel is read-only. Acknowledge signals in darkapi.</p>
     </section>
   </section>
 </main>
@@ -82,6 +97,11 @@ button, input { font: inherit; color: inherit; background: #14160f; border: 1px 
   var recent = document.getElementById("recent");
   var site = document.getElementById("site");
   var grain = document.getElementById("grain");
+  var fleet = document.getElementById("fleet");
+  var fleetStatus = document.getElementById("fleet-status");
+  var fleetHosts = document.getElementById("fleet-hosts");
+  var fleetSignals = document.getElementById("fleet-signals");
+  var fleetRejections = document.getElementById("fleet-rejections");
   var timer = 0;
   var svgNs = "http://www.w3.org/2000/svg";
 
@@ -345,6 +365,91 @@ button, input { font: inherit; color: inherit; background: #14160f; border: 1px 
     recent.appendChild(table);
   }
 
+  function fleetTable(parent, names, rows, cells) {
+    clear(parent);
+    var table = document.createElement("table");
+    var head = document.createElement("tr");
+    for (var h = 0; h < names.length; h += 1) {
+      addText(head, "th", names[h]);
+    }
+    table.appendChild(head);
+    for (var i = 0; i < rows.length; i += 1) {
+      var tr = document.createElement("tr");
+      if (rows[i].class === "breach") {
+        tr.className = "breach";
+      }
+      var values = cells(rows[i]);
+      for (var c = 0; c < values.length; c += 1) {
+        addText(tr, "td", typeof values[c] === "string" ? values[c] : "");
+      }
+      table.appendChild(tr);
+    }
+    parent.appendChild(table);
+  }
+
+  function renderFleet(data) {
+    if (data === null || typeof data !== "object") {
+      fleet.hidden = true;
+      return;
+    }
+    fleet.hidden = false;
+    if (data.state !== "shown" && data.state !== "partial") {
+      fleetStatus.textContent = "dashed: " + problemText(data.problem);
+      dash(fleetHosts);
+      dash(fleetSignals);
+      dash(fleetRejections);
+      return;
+    }
+    var hosts = Array.isArray(data.hosts) ? data.hosts : [];
+    var note = countText(data.hosts_total) + " hosts";
+    if (typeof data.hosts_total === "number" && data.hosts_total > hosts.length) {
+      note += ", first " + String(hosts.length) + " shown";
+    }
+    if (data.state === "partial") {
+      note += "; partial: " + countText(data.skipped) + " rows failed checks";
+    }
+    if (typeof data.fetched_at_ms === "number") {
+      note += "; fetched " + new Date(data.fetched_at_ms).toISOString();
+    }
+    fleetStatus.textContent = note;
+    clear(fleetHosts);
+    for (var i = 0; i < hosts.length; i += 1) {
+      var host = hosts[i];
+      var card = document.createElement("article");
+      card.className = "host-" + problemText(host.status);
+      addText(card, "h3", host.host || "");
+      addText(card, "p", problemText(host.status));
+      var age = typeof host.heartbeat_age_s === "number" ? String(host.heartbeat_age_s) + " s ago" : "no heartbeat";
+      addText(card, "p", age);
+      addText(card, "p", "pending " + countText(host.pending));
+      if (typeof host.version === "string") {
+        addText(card, "p", "darksignal " + host.version);
+      }
+      if (typeof host.darkapple === "string") {
+        addText(card, "p", "darkapple " + host.darkapple);
+      }
+      fleetHosts.appendChild(card);
+    }
+    var signals = Array.isArray(data.signals) ? data.signals : [];
+    fleetTable(fleetSignals, ["priority", "tool", "host", "class", "severity", "rule", "summary", "received"],
+      signals, function (row) {
+        var where = row.host || "";
+        if (typeof row.subject_host === "string" && row.subject_host !== row.host) {
+          where = row.subject_host + " (via " + where + ")";
+        } else if (row.store_attributed === true) {
+          where += " (store-attributed)";
+        }
+        return [row.priority, row.tool, where, row.class, row.severity, row.rule, row.summary, row.received_at];
+      });
+    if (data.signals_more === true) {
+      addText(fleetSignals, "p", "More open signals in darkapi.");
+    }
+    var rejections = Array.isArray(data.rejections) ? data.rejections : [];
+    fleetTable(fleetRejections, ["route", "reason", "received"], rejections, function (row) {
+      return [row.route, row.reason, row.received_at];
+    });
+  }
+
   function render(body) {
     login.hidden = true;
     closed.hidden = true;
@@ -353,6 +458,7 @@ button, input { font: inherit; color: inherit; background: #14160f; border: 1px 
     grain.textContent = typeof body.window_hours === "number" && body.window_hours <= 48 ? "Hourly" : "Daily";
     renderBanner(body);
     renderProblems(body);
+    renderFleet(body.fleet);
     if (componentState(body, "bus") === "shown") {
       renderBus(body);
     } else {

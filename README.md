@@ -2,7 +2,7 @@
 
 Loopback operator console for the local darksignal queue. It shows counts, a time series, and recent rows for the tools named in a signed server policy. A local break-glass file can replace that policy when the settings server is down.
 
-The console does not ship frames, store an API key, or open a producer socket. darksignal is the local bus, not a counted producer. nocved is the sensor; nocve-store is the forwarder. Afterzero counts are pack conditions met, not confirmation of exploitation.
+The console does not ship frames or open a producer socket. It holds an API key only for the optional fleet panel, read from a pinned file (see Fleet). darksignal is the local bus, not a counted producer. nocved is the sensor; nocve-store is the forwarder. Afterzero counts are pack conditions met, not confirmation of exploitation.
 
 ## Layout
 
@@ -54,6 +54,19 @@ An absent break-glass file uses the server policy. A present valid file override
 ## Pin
 
 `darkdash.pin.v1` names the settings URL, both public keys, the break-glass path, `state_dir`, the token path, the audit path, and `bind`. `bind` is `127.0.0.1` and a port. The server cannot change those fields. `state_dir` is the darksignal state directory (mode 0700) that holds `signals.db` and `status.json`.
+
+## Fleet
+
+The pin may add a read-only fleet panel from darkapi's reporting routes. Both fields are present or both are absent:
+
+```
+"fleet_url": "https://api.darkapi.io",
+"fleet_key_file": "/var/lib/darkdash/fleet.key"
+```
+
+`fleet_url` is an HTTPS origin with no path. The key file holds one darkapi user key whose permissions are only `report:read` (darkapi confines such a key to `/v1/reports` and `/v1/sensor-keys`). The file is mode 0600, owned by this user, and outside `state_dir` and every other pinned path. darkdash sends it as `X-API-Key` on three GETs per refresh (`/v1/reports/hosts`, open `/v1/reports/signals`, `/v1/reports/rejections`), at most once every 30 seconds. The panel never acknowledges a signal or mints a key; do that in darkapi.
+
+The panel is `shown`, `partial` when rows failed the field checks, or `dashed` with a problem: `fleet_key` (the file failed its checks), `fleet_key_rejected` (401 or 403), `fleet_limited` (429), `fleet_unreachable`, or `fleet_rejected` (another status or a body that did not parse).
 
 ## Serve
 

@@ -278,12 +278,17 @@ fn https_fetch(pin: &Pin, now: i64) -> Result<Policy, Error> {
 }
 
 fn https_agent() -> ureq::Agent {
+    https_agent_with(Duration::from_secs(10))
+}
+
+/// TLS 1.3, platform verifier, no redirects, no proxy, HTTPS only.
+pub(crate) fn https_agent_with(timeout: Duration) -> ureq::Agent {
     let tls = ureq::tls::TlsConfig::builder()
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
         .unversioned_rustls_crypto_provider(tls13_provider())
         .build();
     ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
+        .timeout_global(Some(timeout))
         .max_redirects(0)
         .proxy(None)
         .http_status_as_error(false)

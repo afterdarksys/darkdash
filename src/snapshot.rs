@@ -10,6 +10,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::fleet::FleetOut;
 use crate::policy::{BreakGlass, CLOCK_SKEW_MS, Policy};
 use crate::queue::{RawRow, StatusView};
 
@@ -28,6 +29,7 @@ pub struct FoldIn<'a> {
     pub source: &'a str,
     pub settings_problem: Option<&'static str>,
     pub glass: Option<&'a BreakGlass>,
+    pub fleet: Option<&'a FleetOut>,
 }
 
 pub fn window_bounds(now: i64, hours: u32) -> (i64, i64) {
@@ -67,6 +69,7 @@ struct Snap<'a> {
     skipped: u32,
     truncated: bool,
     components: Components,
+    fleet: Option<&'a FleetOut>,
 }
 
 #[derive(Serialize)]
@@ -183,6 +186,7 @@ fn assemble<'a>(input: &FoldIn<'a>, readings: Readings) -> Snap<'a> {
         skipped: readings.skipped,
         truncated: readings.truncated,
         components,
+        fleet: input.fleet,
     }
 }
 
@@ -372,7 +376,7 @@ fn state_label(value: &str) -> Option<&'static str> {
     }
 }
 
-fn rule_ok(rule: &str) -> bool {
+pub(crate) fn rule_ok(rule: &str) -> bool {
     let bytes = rule.as_bytes();
     if bytes.is_empty() || bytes.len() > 128 {
         return false;
@@ -390,7 +394,7 @@ fn rule_ok(rule: &str) -> bool {
     })
 }
 
-fn summary_ok(text: &str) -> bool {
+pub(crate) fn summary_ok(text: &str) -> bool {
     let count = text.chars().count();
     if count == 0 || count > 512 {
         return false;
@@ -404,7 +408,7 @@ fn summary_ok(text: &str) -> bool {
     })
 }
 
-fn display_summary(text: &str) -> String {
+pub(crate) fn display_summary(text: &str) -> String {
     text.chars().take(180).collect()
 }
 
@@ -578,6 +582,7 @@ mod tests {
             source: "server",
             settings_problem: None,
             glass: None,
+            fleet: None,
         };
         let bytes = build(&input).unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -684,6 +689,7 @@ mod tests {
             source: "server",
             settings_problem: None,
             glass: None,
+            fleet: None,
         };
         let bytes = build(&input).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -721,6 +727,7 @@ mod tests {
             source: "server",
             settings_problem: None,
             glass: None,
+            fleet: None,
         };
         let bytes = build(&input).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

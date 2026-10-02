@@ -4,6 +4,8 @@
 //! session ids are compared in constant time. Eight failures lock the
 //! listener for 60 seconds. A closed policy returns 503 and does not read
 //! the queue. The page never receives join, dedupe, or evidence fields.
+//! The optional fleet panel reads darkapi only after the policy resolves,
+//! with GETs only (see `fleet`).
 //!
 //! The accept loop is single-threaded. One stalled client can block the next
 //! connection for the five-second read timeout.
@@ -24,6 +26,7 @@ use crate::auth::{
 };
 use crate::error::Error;
 use crate::fetch::{FetchCtx, HttpsSource, PolicyCache, SettingsSource, known, resolve};
+use crate::fleet::{self, FleetCache, FleetSource, HttpsFleet};
 use crate::guard::clean_abs;
 use crate::pin::{LOOPBACK, Pin, load_pin};
 use crate::queue;
@@ -42,6 +45,7 @@ struct Runtime {
     audited: Mutex<std::collections::HashSet<String>>,
     auth: Mutex<AuthState>,
     sessions: Mutex<Sessions>,
+    fleet: FleetCache,
 }
 
 struct Ctx<'a> {
@@ -49,6 +53,7 @@ struct Ctx<'a> {
     port: u16,
     clock: &'a Clock,
     source: &'a dyn SettingsSource,
+    fleet: &'a dyn FleetSource,
     runtime: &'a Runtime,
 }
 
@@ -156,9 +161,10 @@ pub(crate) fn serve(pin_path: &std::path::Path) -> Result<(), Error> {
     let bound = listener.local_addr()?.port();
     eprintln!("darkdash: listening {LOOPBACK}:{bound}");
     let source: Arc<dyn SettingsSource> = Arc::new(HttpsSource);
+    let fleet: Arc<dyn FleetSource> = Arc::new(HttpsFleet);
     let clock: Clock = Arc::new(system_now as fn() -> Result<i64, ()>);
     let stop = AtomicBool::new(false);
-    serve_listener(&listener, &pin, &clock, &source, &stop)
+    serve_listener(&listener, &pin, &clock, &source, &fleet, &stop)
 }
 
 pub(crate) fn serve_listener(
@@ -166,6 +172,7 @@ pub(crate) fn serve_listener(
     pin: &Pin,
     clock: &Clock,
     source: &Arc<dyn SettingsSource>,
+    fleet: &Arc<dyn FleetSource>,
     stop: &AtomicBool,
 ) -> Result<(), Error> {
     listener.set_nonblocking(true)?;
@@ -175,12 +182,14 @@ pub(crate) fn serve_listener(
         audited: Mutex::new(std::collections::HashSet::new()),
         auth: Mutex::new(AuthState::new()),
         sessions: Mutex::new(Sessions::new()),
+        fleet: FleetCache::new(),
     };
     let ctx = Ctx {
         pin,
         port,
         clock,
         source: source.as_ref(),
+        fleet: fleet.as_ref(),
         runtime: &runtime,
     };
     accept_loop(listener, &ctx, stop)
@@ -743,6 +752,11 @@ fn render_snapshot(ctx: &Ctx<'_>, now: i64) -> Reply {
     };
     let (start, end) = window_bounds(now, active.policy.window_hours);
     let loaded = queue::load(&ctx.pin.state_dir, now, start, end);
+    let fleet = ctx
+        .pin
+        .fleet
+        .as_ref()
+        .map(|pinned| fleet::current(ctx.fleet, pinned, &ctx.runtime.fleet, now));
     let input = FoldIn {
         rows: &loaded.rows,
         truncated: loaded.truncated,
@@ -753,6 +767,7 @@ fn render_snapshot(ctx: &Ctx<'_>, now: i64) -> Reply {
         source: active.source,
         settings_problem: active.settings_problem,
         glass: active.glass.as_ref(),
+        fleet: fleet.as_ref(),
     };
     match snapshot::build(&input) {
         Ok(body) => Reply {
@@ -840,6 +855,7 @@ mod tests {
     use super::*;
     use crate::auth::write_token;
     use crate::fetch::ScriptedSource;
+    use crate::fleet::{ScriptedFleet, fixtures};
     use crate::guard::write_private_new;
     use crate::pin::parse_pin;
     use crate::policy::{parse_policy, public_from_secret, sign_break_glass};
@@ -854,6 +870,7 @@ mod tests {
         _root: tempfile::TempDir,
         pin: Pin,
         source: Arc<ScriptedSource>,
+        fleet: Arc<ScriptedFleet>,
         clock: Arc<AtomicI64>,
         token: String,
     }
@@ -887,11 +904,19 @@ mod tests {
         )
     }
 
-    fn pin_for(dir: &Path, server: &[u8; 32], glass: &[u8; 32]) -> Pin {
+    fn pin_for(dir: &Path, server: &[u8; 32], glass: &[u8; 32], fleet: bool) -> Pin {
         let server_hex = hex::encode(public_from_secret(server).unwrap());
         let glass_hex = hex::encode(public_from_secret(glass).unwrap());
+        let fleet_fields = if fleet {
+            format!(
+                ",\"fleet_url\":\"https://api.darkapi.example\",\"fleet_key_file\":\"{}\"",
+                dir.join("fleet.key").display()
+            )
+        } else {
+            String::new()
+        };
         let text = format!(
-            "{{\"schema\":\"darkdash.pin.v1\",\"settings_url\":\"https://darkapi.example/v1/darkdash/settings\",\"server_pubkey\":\"{server_hex}\",\"break_glass_pubkey\":\"{glass_hex}\",\"break_glass_file\":\"{}\",\"state_dir\":\"{}\",\"token_file\":\"{}\",\"audit_file\":\"{}\",\"bind\":\"127.0.0.1:9\"}}",
+            "{{\"schema\":\"darkdash.pin.v1\",\"settings_url\":\"https://darkapi.example/v1/darkdash/settings\",\"server_pubkey\":\"{server_hex}\",\"break_glass_pubkey\":\"{glass_hex}\",\"break_glass_file\":\"{}\",\"state_dir\":\"{}\",\"token_file\":\"{}\",\"audit_file\":\"{}\",\"bind\":\"127.0.0.1:9\"{fleet_fields}}}",
             dir.join("glass").display(),
             dir.join("state").display(),
             dir.join("token").display(),
@@ -930,8 +955,12 @@ mod tests {
     }
 
     fn lab(summary: &str, down: bool) -> Lab {
+        lab_with(summary, down, false)
+    }
+
+    fn lab_with(summary: &str, down: bool, fleet: bool) -> Lab {
         let root = tempfile::tempdir().unwrap();
-        let pin = pin_for(root.path(), &secret(1), &secret(2));
+        let pin = pin_for(root.path(), &secret(1), &secret(2), fleet);
         fs::create_dir(&pin.state_dir).unwrap();
         fs::set_permissions(&pin.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
         write_private_new(
@@ -955,6 +984,7 @@ mod tests {
             _root: root,
             pin,
             source,
+            fleet: Arc::new(ScriptedFleet::new(Ok(fixtures::good()))),
             clock: Arc::new(AtomicI64::new(NOW)),
             token,
         }
@@ -967,11 +997,13 @@ mod tests {
         let clock: Clock = Arc::new(move || Ok(ticks.load(Ordering::SeqCst)));
         let owned = Arc::clone(&lab.source);
         let source: Arc<dyn SettingsSource> = owned;
+        let owned_fleet = Arc::clone(&lab.fleet);
+        let fleet: Arc<dyn FleetSource> = owned_fleet;
         let stop = AtomicBool::new(false);
         thread::scope(|scope| {
             let guard = StopGuard { stop: &stop };
-            let handle =
-                scope.spawn(|| serve_listener(&listener, &lab.pin, &clock, &source, &stop));
+            let handle = scope
+                .spawn(|| serve_listener(&listener, &lab.pin, &clock, &source, &fleet, &stop));
             let value = body(port);
             drop(guard);
             assert!(matches!(handle.join(), Ok(Ok(()))));
@@ -1128,6 +1160,52 @@ mod tests {
             let leaked = body.contains(&lab.token);
             assert!(!leaked);
         });
+    }
+
+    #[test]
+    fn fleet_panel_is_off_without_a_pinned_fleet() {
+        let lab = lab("pack conditions met", false);
+        serve_for(&lab, |port| {
+            let raw = exchange(port, &post_session(port, &lab.token, None));
+            let cookie = session_pair(&raw);
+            let snap = exchange(port, &authed_get(port, "/api/snapshot", &cookie));
+            assert!(body_after(&snap).contains("\"fleet\":null"));
+        });
+        assert_eq!(lab.fleet.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fleet_panel_is_projected_into_the_snapshot() {
+        let lab = lab_with("pack conditions met", false, true);
+        serve_for(&lab, |port| {
+            let raw = exchange(port, &post_session(port, &lab.token, None));
+            let cookie = session_pair(&raw);
+            let snap = exchange(port, &authed_get(port, "/api/snapshot", &cookie));
+            assert!(snap.starts_with("HTTP/1.1 200 "));
+            let body = body_after(&snap);
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["fleet"]["state"], "shown");
+            assert_eq!(value["fleet"]["hosts"][1]["host"], "ns2");
+            assert_eq!(value["fleet"]["signals"][0]["rule"], "chain.rollback");
+            for secret in ["JOIN-FLEET-SECRET", "DEDUPE-FLEET-SECRET", "ITEMHASHSECRET"] {
+                assert!(!body.contains(secret));
+            }
+            let again = exchange(port, &authed_get(port, "/api/snapshot", &cookie));
+            assert!(again.starts_with("HTTP/1.1 200 "));
+        });
+        assert_eq!(lab.fleet.calls.load(Ordering::SeqCst), 1, "cached within 30 s");
+    }
+
+    #[test]
+    fn closed_policy_does_not_call_the_fleet() {
+        let lab = lab_with("pack conditions met", true, true);
+        serve_for(&lab, |port| {
+            let raw = exchange(port, &post_session(port, &lab.token, None));
+            let cookie = session_pair(&raw);
+            let snap = exchange(port, &authed_get(port, "/api/snapshot", &cookie));
+            assert!(snap.starts_with("HTTP/1.1 503 "));
+        });
+        assert_eq!(lab.fleet.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

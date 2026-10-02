@@ -3,6 +3,7 @@ mod auth;
 mod cli;
 mod error;
 mod fetch;
+mod fleet;
 mod guard;
 mod http;
 mod pin;
