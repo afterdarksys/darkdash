@@ -1,0 +1,323 @@
+//! Local pin. The server cannot change the bind address, the state
+//! directory, the keys, or the settings URL.
+//!
+//! Threats: a relative path, a non-loopback bind, an HTTP settings URL, a
+//! weak or all-zero public key, or two identical signing keys must not open
+//! the console. Unknown JSON fields fail closed. The pin file itself is
+//! mode 0600, owned by this euid, and not a symlink.
+
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::error::Error;
+use crate::guard::{clean_abs, is_inside, read_private};
+use crate::policy::{parse_pubkey, pubkeys_differ};
+
+const MAX_PIN: u64 = 8192;
+pub const LOOPBACK: &str = "127.0.0.1";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinFile {
+    schema: String,
+    settings_url: String,
+    server_pubkey: String,
+    break_glass_pubkey: String,
+    break_glass_file: String,
+    state_dir: String,
+    token_file: String,
+    audit_file: String,
+    bind: String,
+}
+
+pub struct Pin {
+    pub settings_url: String,
+    pub server_pubkey: [u8; 32],
+    pub break_glass_pubkey: [u8; 32],
+    pub break_glass_file: PathBuf,
+    pub state_dir: PathBuf,
+    pub token_file: PathBuf,
+    pub audit_file: PathBuf,
+    pub port: u16,
+}
+
+impl Pin {
+    pub fn origin(&self, port: u16) -> String {
+        format!("http://{LOOPBACK}:{port}")
+    }
+
+    pub fn host_header(&self, port: u16) -> String {
+        format!("{LOOPBACK}:{port}")
+    }
+}
+
+pub fn load_pin(path: &Path) -> Result<Pin, Error> {
+    let bytes = read_private(path, MAX_PIN)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| Error::Config("pin"))?;
+    parse_pin(text)
+}
+
+pub fn parse_pin(text: &str) -> Result<Pin, Error> {
+    if text.len() > usize::try_from(MAX_PIN).unwrap_or(8192) {
+        return Err(Error::Config("pin"));
+    }
+    let file: PinFile = serde_json::from_str(text).map_err(|_| Error::Config("pin"))?;
+    if file.schema != "darkdash.pin.v1" {
+        return Err(Error::Config("pin"));
+    }
+    validate_url(&file.settings_url)?;
+    let server = parse_pubkey(&file.server_pubkey)?;
+    let glass = parse_pubkey(&file.break_glass_pubkey)?;
+    if !pubkeys_differ(&server, &glass) {
+        return Err(Error::Config("pubkey"));
+    }
+    let break_glass_file = clean_abs(&file.break_glass_file)?;
+    let state_dir = clean_abs(&file.state_dir)?;
+    let token_file = clean_abs(&file.token_file)?;
+    let audit_file = clean_abs(&file.audit_file)?;
+    let port = parse_bind(&file.bind)?;
+    if crowded(&break_glass_file, &state_dir)
+        || crowded(&token_file, &state_dir)
+        || crowded(&audit_file, &state_dir)
+        || crowded(&break_glass_file, &token_file)
+        || crowded(&break_glass_file, &audit_file)
+        || crowded(&token_file, &audit_file)
+    {
+        return Err(Error::Config("path"));
+    }
+    Ok(Pin {
+        settings_url: file.settings_url,
+        server_pubkey: server,
+        break_glass_pubkey: glass,
+        break_glass_file,
+        state_dir,
+        token_file,
+        audit_file,
+        port,
+    })
+}
+
+fn crowded(left: &Path, right: &Path) -> bool {
+    left == right || is_inside(left, right) || is_inside(right, left)
+}
+
+fn parse_bind(bind: &str) -> Result<u16, Error> {
+    let rest = bind
+        .strip_prefix("127.0.0.1:")
+        .ok_or(Error::Config("bind"))?;
+    parse_port(rest).map_err(|_| Error::Config("bind"))
+}
+
+fn parse_port(raw: &str) -> Result<u16, ()> {
+    if raw.is_empty() || raw.len() > 5 || (raw.len() > 1 && raw.starts_with('0')) {
+        return Err(());
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    let port: u16 = raw.parse().map_err(|_| ())?;
+    if port == 0 {
+        return Err(());
+    }
+    Ok(port)
+}
+
+fn validate_url(url: &str) -> Result<(), Error> {
+    if url.len() > 2048 || url.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(Error::Config("url"));
+    }
+    if url.contains('@') || url.contains('?') || url.contains('#') || url.contains('\\') {
+        return Err(Error::Config("url"));
+    }
+    if url.ends_with('/') {
+        return Err(Error::Config("url"));
+    }
+    let rest = url.strip_prefix("https://").ok_or(Error::Config("url"))?;
+    if rest.is_empty() || rest.contains('[') || rest.contains(']') {
+        return Err(Error::Config("url"));
+    }
+    let (hostport, path) = match rest.split_once('/') {
+        Some((host, path)) => (host, Some(path)),
+        None => (rest, None),
+    };
+    let (host, port) = split_host(hostport)?;
+    host_ok(host)?;
+    if let Some(raw) = port {
+        parse_port(raw).map_err(|_| Error::Config("url"))?;
+    }
+    if let Some(path) = path {
+        path_ok(path)?;
+    }
+    Ok(())
+}
+
+fn split_host(hostport: &str) -> Result<(&str, Option<&str>), Error> {
+    if let Some((host, port)) = hostport.rsplit_once(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Ok((host, Some(port)));
+    }
+    Ok((hostport, None))
+}
+
+fn host_ok(host: &str) -> Result<(), Error> {
+    if host.is_empty()
+        || host.len() > 253
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.contains("..")
+    {
+        return Err(Error::Config("url"));
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return Err(Error::Config("url"));
+    }
+    Ok(())
+}
+
+fn path_ok(path: &str) -> Result<(), Error> {
+    if path.is_empty() {
+        return Err(Error::Config("url"));
+    }
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(Error::Config("url"));
+        }
+        if !segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+        {
+            return Err(Error::Config("url"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::public_from_secret;
+
+    fn pubkey(byte: u8) -> String {
+        let mut secret = [byte; 32];
+        secret[0] = byte.wrapping_add(9);
+        hex::encode(public_from_secret(&secret).unwrap())
+    }
+
+    fn document(url: &str, server: &str, glass: &str, bind: &str) -> String {
+        with_paths(
+            url,
+            server,
+            glass,
+            bind,
+            "/var/lib/darksignal",
+            "/var/lib/darkdash/token",
+        )
+    }
+
+    fn with_paths(
+        url: &str,
+        server: &str,
+        glass: &str,
+        bind: &str,
+        state: &str,
+        token: &str,
+    ) -> String {
+        let glass_path = "/var/lib/darkdash/break-glass.json";
+        let audit = "/var/lib/darkdash/audit";
+        format!(
+            r#"{{"schema":"darkdash.pin.v1","settings_url":"{url}","server_pubkey":"{server}","break_glass_pubkey":"{glass}","break_glass_file":"{glass_path}","state_dir":"{state}","token_file":"{token}","audit_file":"{audit}","bind":"{bind}"}}"#
+        )
+    }
+
+    fn good() -> String {
+        document(
+            "https://darkapi.example/v1/darkdash/settings",
+            &pubkey(1),
+            &pubkey(2),
+            "127.0.0.1:9",
+        )
+    }
+
+    #[test]
+    fn accepts_https_and_a_loopback_bind() {
+        let pin = parse_pin(&good()).unwrap();
+        assert_eq!(pin.port, 9);
+        assert!(pin.settings_url.starts_with("https://"));
+        let with_port = document(
+            "https://darkapi.example:443/v1/darkdash/settings",
+            &pubkey(1),
+            &pubkey(2),
+            "127.0.0.1:443",
+        );
+        assert!(parse_pin(&with_port).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_pin_material() {
+        let server = pubkey(1);
+        let http = document(
+            "http://darkapi.example/v1/darkdash/settings",
+            &server,
+            &pubkey(2),
+            "127.0.0.1:9",
+        );
+        assert!(parse_pin(&http).is_err());
+        let wide = document(
+            "https://darkapi.example/v1/darkdash/settings",
+            &server,
+            &pubkey(2),
+            "0.0.0.0:9",
+        );
+        assert!(parse_pin(&wide).is_err());
+        let same = document(
+            "https://darkapi.example/v1/darkdash/settings",
+            &server,
+            &server,
+            "127.0.0.1:9",
+        );
+        assert!(parse_pin(&same).is_err());
+        let relative = with_paths(
+            "https://darkapi.example/v1/darkdash/settings",
+            &server,
+            &pubkey(2),
+            "127.0.0.1:9",
+            "relative",
+            "/var/lib/darkdash/token",
+        );
+        assert!(parse_pin(&relative).is_err());
+        let mut extra: serde_json::Value = serde_json::from_str(&good()).unwrap();
+        extra["extra"] = serde_json::json!(1);
+        assert!(parse_pin(&extra.to_string()).is_err());
+        let small = "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f";
+        let weak = document(
+            "https://darkapi.example/v1/darkdash/settings",
+            small,
+            &pubkey(2),
+            "127.0.0.1:9",
+        );
+        assert!(parse_pin(&weak).is_err());
+        let zeros = "0".repeat(64);
+        let zeroed = document(
+            "https://darkapi.example/v1/darkdash/settings",
+            &zeros,
+            &pubkey(2),
+            "127.0.0.1:9",
+        );
+        assert!(parse_pin(&zeroed).is_err());
+        let inside = with_paths(
+            "https://darkapi.example/v1/darkdash/settings",
+            &server,
+            &pubkey(2),
+            "127.0.0.1:9",
+            "/var/lib/darksignal",
+            "/var/lib/darksignal/token",
+        );
+        assert!(parse_pin(&inside).is_err());
+    }
+}

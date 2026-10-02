@@ -1,0 +1,5 @@
+# Security
+
+Threats: the listener accepts only 127.0.0.1. Settings are fetched with TLS 1.3, the platform verifier, no redirects, and no proxy. The operator token and session ids are compared in constant time. Eight failures lock the listener for 60 seconds. Break-glass is a separate signature over the reason and the actor. An invalid break-glass file closes the console instead of falling back to the server. The snapshot drops join values, dedupe values, and evidence paths. A failed queue check omits counts, so a failed read is not a row of zeros. The bus strip is omitted unless status.json parsed. A same-uid edit of a readable database remains outside the file check.
+
+lstat, open, and fstat cover the pin, the token, the audit file, the break-glass file, and status.json. signals.db is opened by path afterward, so a same-uid sidecar swap after that check is still possible. That open resolves ancestor symlinks and still refuses a symlinked signals.db. The process does not walk the state directory.

@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>darkdash</title>
+<style>
+body { margin: 0; background: #14160f; color: #e6e2d4; font-family: system-ui, sans-serif; }
+header, main { padding: 16px; }
+h1, h2, p { margin: 0 0 8px; }
+#cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+article, section { background: #1e2218; padding: 12px; margin-bottom: 12px; }
+.muted { color: #9a947f; }
+[hidden] { display: none !important; }
+.dashed { color: #9a947f; border: 1px dashed #9a947f; padding: 8px; }
+:focus-visible { outline: 2px solid #e0a100; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+td, th { text-align: left; padding: 4px 8px; vertical-align: top; }
+tr.breach { color: #d24a3a; }
+#legend i { display: inline-block; width: 12px; height: 12px; margin-right: 6px; }
+#legend span { margin-right: 12px; }
+svg { width: 100%; height: auto; background: #14160f; }
+button, input { font: inherit; color: inherit; background: #14160f; border: 1px solid #9a947f; padding: 6px 8px; }
+@media (max-width: 720px) {
+  header, #cards { display: block; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>darkdash</h1>
+  <p>site <span id="site"></span></p>
+</header>
+<main>
+  <noscript>This console needs JavaScript on localhost.</noscript>
+  <section id="login">
+    <form id="gate" method="post" autocomplete="off">
+      <label for="token">Operator token</label>
+      <input id="token" type="password" autocomplete="off">
+      <button type="submit">Enter</button>
+    </form>
+  </section>
+  <section id="closed" hidden>
+    <h2>Closed</h2>
+    <p id="closed-problem"></p>
+  </section>
+  <section id="board" hidden>
+    <p><button id="logout" type="button">Log out</button></p>
+    <section id="banner" hidden></section>
+    <section id="problems"></section>
+    <section id="bus"></section>
+    <section id="cards"></section>
+    <section id="chart">
+      <h2 id="grain">Hourly</h2>
+      <svg id="trend" viewBox="0 0 720 220" role="img"></svg>
+    </section>
+    <section id="legend"></section>
+    <section id="recent" class="scroll"></section>
+    <section id="notes" class="muted">
+      <p>Afterzero counts are pack conditions met, not confirmation of exploitation.</p>
+      <p>nocved is the sensor; nocve-store is the forwarder.</p>
+      <p>darksignal is the local bus, not a counted producer.</p>
+    </section>
+  </section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var login = document.getElementById("login");
+  var gate = document.getElementById("gate");
+  var token = document.getElementById("token");
+  var closed = document.getElementById("closed");
+  var closedProblem = document.getElementById("closed-problem");
+  var board = document.getElementById("board");
+  var banner = document.getElementById("banner");
+  var problems = document.getElementById("problems");
+  var bus = document.getElementById("bus");
+  var cards = document.getElementById("cards");
+  var chart = document.getElementById("trend");
+  var legend = document.getElementById("legend");
+  var recent = document.getElementById("recent");
+  var site = document.getElementById("site");
+  var grain = document.getElementById("grain");
+  var timer = 0;
+  var svgNs = "http://www.w3.org/2000/svg";
+
+  function clear(node) {
+    while (node.firstChild) {
+      node.removeChild(node.firstChild);
+    }
+  }
+
+  function addText(parent, tag, value) {
+    var el = document.createElement(tag);
+    el.textContent = value;
+    parent.appendChild(el);
+    return el;
+  }
+
+  function toolColor(name) {
+    switch (name) {
+      case "nocved": return "#d24a3a";
+      case "darkapple": return "#7d9a62";
+      case "afterzero": return "#e0a100";
+      case "cveguard": return "#d8d2c0";
+      case "aftercve": return "#c47b4a";
+      case "afterseal": return "#8aa4b5";
+      case "nocve-store": return "#b5838d";
+      default: return "#9a947f";
+    }
+  }
+
+  function problemText(value) {
+    if (typeof value === "string" && /^[a-z0-9_]{1,40}$/.test(value)) {
+      return value;
+    }
+    return "closed";
+  }
+
+  function countText(value) {
+    if (typeof value === "number") {
+      return String(value);
+    }
+    return "unknown";
+  }
+
+  function showLogin() {
+    login.hidden = false;
+    board.hidden = true;
+    closed.hidden = true;
+  }
+
+  function showClosed(problem) {
+    login.hidden = true;
+    board.hidden = true;
+    closed.hidden = false;
+    closedProblem.textContent = problemText(problem);
+  }
+
+  function schedule(ms) {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(tick, ms);
+  }
+
+  function renderBanner(body) {
+    clear(banner);
+    var glass = body.break_glass;
+    if (!glass) {
+      banner.hidden = true;
+      return;
+    }
+    banner.hidden = false;
+    addText(banner, "p", typeof glass.reason === "string" ? glass.reason : "");
+    addText(banner, "p", typeof glass.actor === "string" ? glass.actor : "");
+    var when = typeof glass.expires_at_ms === "number" ? new Date(glass.expires_at_ms).toISOString() : "";
+    addText(banner, "p", when);
+  }
+
+  function componentState(body, name) {
+    var parts = body.components;
+    if (!parts || typeof parts[name] !== "string") {
+      return "dashed";
+    }
+    if (parts[name] === "shown" || parts[name] === "partial" || parts[name] === "dashed") {
+      return parts[name];
+    }
+    return "dashed";
+  }
+
+  function dash(node) {
+    clear(node);
+    var note = addText(node, "p", "dashed");
+    note.className = "dashed";
+  }
+
+  function skippedText(value) {
+    if (typeof value !== "number" || value % 1 !== 0 || value < 1 || value > 5000) {
+      return "";
+    }
+    return "skipped " + String(value);
+  }
+
+  function renderProblems(body) {
+    clear(problems);
+    if (body.settings_problem) {
+      addText(problems, "p", "settings " + problemText(body.settings_problem));
+    }
+    if (body.queue_problem) {
+      addText(problems, "p", "queue " + problemText(body.queue_problem));
+    }
+    if (componentState(body, "queue") !== "partial") {
+      return;
+    }
+    if (body.truncated === true) {
+      addText(problems, "p", "truncated");
+    }
+    var skipped = skippedText(body.skipped);
+    if (skipped) {
+      addText(problems, "p", skipped);
+    }
+    if (body.truncated !== true && !skipped) {
+      addText(problems, "p", "partial");
+    }
+  }
+
+  function renderBus(body) {
+    clear(bus);
+    var status = body.status || {};
+    var host = typeof body.host === "string" ? body.host : "";
+    addText(bus, "p", "host " + host);
+    addText(bus, "p", "read " + (typeof status.read === "string" ? status.read : ""));
+    addText(bus, "p", "pending " + countText(status.pending));
+    addText(bus, "p", "dropped " + countText(status.dropped));
+    var beat = addText(bus, "p", "heartbeat " + String(status.heartbeat_ok));
+    if (status.heartbeat_ok === true) {
+      beat.style.color = "#7d9a62";
+    }
+    if (status.stale === true) {
+      var stale = addText(bus, "p", "stale");
+      stale.style.color = "#e0a100";
+    }
+  }
+
+  function renderCards(tools) {
+    clear(cards);
+    var list = tools || [];
+    for (var i = 0; i < list.length; i += 1) {
+      var item = list[i];
+      var card = document.createElement("article");
+      addText(card, "h3", item.tool || "");
+      addText(card, "p", "total " + countText(item.total));
+      var pending = addText(card, "p", "pending " + countText(item.pending));
+      if (typeof item.pending === "number" && item.pending > 0) {
+        pending.style.color = "#e0a100";
+      }
+      addText(card, "p", "sent " + countText(item.sent));
+      addText(card, "p", "rejected " + countText(item.rejected));
+      addText(card, "p", "breach " + countText(item.breach));
+      if (item.silent === true) {
+        var silent = addText(card, "p", "silent");
+        silent.style.color = "#e0a100";
+      }
+      cards.appendChild(card);
+    }
+  }
+
+  function renderLegend(series) {
+    clear(legend);
+    var list = series || [];
+    for (var i = 0; i < list.length; i += 1) {
+      var row = document.createElement("span");
+      var swatch = document.createElement("i");
+      swatch.style.background = toolColor(list[i].tool);
+      row.appendChild(swatch);
+      var label = document.createElement("span");
+      label.textContent = list[i].tool || "";
+      row.appendChild(label);
+      legend.appendChild(row);
+    }
+  }
+
+  function pointY(count, max) {
+    var value = typeof count === "number" ? count : 0;
+    return 196 - Math.round((value / max) * 172);
+  }
+
+  function drawSeries(item) {
+    var points = item.points || [];
+    var n = points.length;
+    if (n === 0) {
+      return;
+    }
+    var max = 1;
+    for (var i = 0; i < n; i += 1) {
+      if (typeof points[i].count === "number" && points[i].count > max) {
+        max = points[i].count;
+      }
+    }
+    var coords = [];
+    for (var j = 0; j < n; j += 1) {
+      var x = 24;
+      if (n > 1) {
+        x = 24 + Math.round(j * 672 / (n - 1));
+        if (j === n - 1) {
+          x = 696;
+        }
+      }
+      var y = pointY(points[j].count, max);
+      coords.push(String(x) + "," + String(y));
+      if (n === 1) {
+        coords.push(String(x + 36) + "," + String(y));
+      }
+    }
+    var line = document.createElementNS(svgNs, "polyline");
+    line.setAttribute("points", coords.join(" "));
+    line.setAttribute("fill", "none");
+    line.setAttribute("stroke", toolColor(item.tool));
+    var title = document.createElementNS(svgNs, "title");
+    title.textContent = item.tool || "";
+    line.appendChild(title);
+    chart.appendChild(line);
+  }
+
+  function drawChart(series) {
+    clear(chart);
+    var base = document.createElementNS(svgNs, "polyline");
+    base.setAttribute("points", "24,196 696,196");
+    base.setAttribute("fill", "none");
+    base.setAttribute("stroke", "#9a947f");
+    chart.appendChild(base);
+    var list = series || [];
+    for (var i = 0; i < list.length; i += 1) {
+      drawSeries(list[i]);
+    }
+  }
+
+  function renderRecent(rows) {
+    clear(recent);
+    var table = document.createElement("table");
+    var head = document.createElement("tr");
+    var names = ["tool", "class", "severity", "priority", "rule", "summary", "state", "at"];
+    for (var h = 0; h < names.length; h += 1) {
+      addText(head, "th", names[h]);
+    }
+    table.appendChild(head);
+    var list = rows || [];
+    for (var i = 0; i < list.length; i += 1) {
+      var row = list[i];
+      var tr = document.createElement("tr");
+      if (row.class === "breach") {
+        tr.className = "breach";
+      }
+      addText(tr, "td", row.tool || "");
+      addText(tr, "td", row.class || "");
+      addText(tr, "td", row.severity || "");
+      addText(tr, "td", row.priority || "");
+      addText(tr, "td", row.rule || "");
+      addText(tr, "td", row.summary || "");
+      addText(tr, "td", row.state || "");
+      var at = typeof row.at_ms === "number" ? new Date(row.at_ms).toISOString() : "";
+      addText(tr, "td", at);
+      table.appendChild(tr);
+    }
+    recent.appendChild(table);
+  }
+
+  function render(body) {
+    login.hidden = true;
+    closed.hidden = true;
+    board.hidden = false;
+    site.textContent = typeof body.site === "string" ? body.site : "";
+    grain.textContent = typeof body.window_hours === "number" && body.window_hours <= 48 ? "Hourly" : "Daily";
+    renderBanner(body);
+    renderProblems(body);
+    if (componentState(body, "bus") === "shown") {
+      renderBus(body);
+    } else {
+      dash(bus);
+    }
+    if (componentState(body, "queue") === "dashed") {
+      grain.textContent = "dashed";
+      dash(cards);
+      clear(legend);
+      clear(chart);
+      dash(recent);
+      return;
+    }
+    renderCards(body.tools);
+    renderLegend(body.series);
+    drawChart(body.series);
+    renderRecent(body.recent);
+  }
+
+  function tick() {
+    window.fetch("/api/snapshot", { credentials: "same-origin" }).then(function (resp) {
+      if (resp.status === 401) {
+        showLogin();
+        schedule(15000);
+        return null;
+      }
+      if (resp.status === 503) {
+        return resp.json().then(function (body) {
+          showClosed(body && body.problem);
+          schedule(15000);
+          return null;
+        });
+      }
+      if (!resp.ok) {
+        showClosed("closed");
+        schedule(15000);
+        return null;
+      }
+      return resp.json();
+    }).then(function (body) {
+      if (!body) {
+        return;
+      }
+      render(body);
+      var seconds = body.refresh_seconds;
+      var ms = 15000;
+      if (typeof seconds === "number" && seconds >= 5 && seconds <= 120) {
+        ms = seconds * 1000;
+      }
+      schedule(ms);
+    }).catch(function () {
+      schedule(15000);
+    });
+  }
+
+  gate.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var value = token.value;
+    token.value = "";
+    window.fetch("/session", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "text/plain" },
+      body: value
+    }).then(function (resp) {
+      if (resp.ok) {
+        tick();
+        return;
+      }
+      showLogin();
+    }).catch(function () {
+      showLogin();
+    });
+  });
+
+  document.getElementById("logout").addEventListener("click", function () {
+    window.fetch("/logout", {
+      method: "POST",
+      credentials: "same-origin",
+      body: ""
+    }).then(function () {
+      showLogin();
+    }).catch(function () {
+      showLogin();
+    });
+  });
+
+  tick();
+})();
+</script>
+</body>
+</html>
