@@ -1002,8 +1002,8 @@ mod tests {
         let stop = AtomicBool::new(false);
         thread::scope(|scope| {
             let guard = StopGuard { stop: &stop };
-            let handle = scope
-                .spawn(|| serve_listener(&listener, &lab.pin, &clock, &source, &fleet, &stop));
+            let handle =
+                scope.spawn(|| serve_listener(&listener, &lab.pin, &clock, &source, &fleet, &stop));
             let value = body(port);
             drop(guard);
             assert!(matches!(handle.join(), Ok(Ok(()))));
@@ -1183,7 +1183,7 @@ mod tests {
             let snap = exchange(port, &authed_get(port, "/api/snapshot", &cookie));
             assert!(snap.starts_with("HTTP/1.1 200 "));
             let body = body_after(&snap);
-            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
             assert_eq!(value["fleet"]["state"], "shown");
             assert_eq!(value["fleet"]["hosts"][1]["host"], "ns2");
             assert_eq!(value["fleet"]["signals"][0]["rule"], "chain.rollback");
@@ -1193,7 +1193,11 @@ mod tests {
             let again = exchange(port, &authed_get(port, "/api/snapshot", &cookie));
             assert!(again.starts_with("HTTP/1.1 200 "));
         });
-        assert_eq!(lab.fleet.calls.load(Ordering::SeqCst), 1, "cached within 30 s");
+        assert_eq!(
+            lab.fleet.calls.load(Ordering::SeqCst),
+            1,
+            "cached within 30 s"
+        );
     }
 
     #[test]

@@ -389,9 +389,9 @@ fn version_text(value: &Value) -> Option<String> {
 fn time_text(value: &Value) -> Option<String> {
     let text = value.as_str()?;
     let ok = (10..=40).contains(&text.len())
-        && text.bytes().all(|b| {
-            b.is_ascii_digit() || matches!(b, b'T' | b'Z' | b':' | b'.' | b'+' | b'-')
-        });
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'T' | b'Z' | b':' | b'.' | b'+' | b'-'));
     ok.then(|| text.to_string())
 }
 
@@ -399,9 +399,9 @@ fn route_text(value: &Value) -> Option<String> {
     let text = value.as_str()?;
     let ok = text.starts_with("/v1/")
         && text.len() <= 64
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'/' | b'_' | b'-'));
+        && text.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'/' | b'_' | b'-')
+        });
     ok.then(|| text.to_string())
 }
 
@@ -555,7 +555,11 @@ pub(crate) mod fixtures {
     ],"next_cursor":null}"#;
 
     pub(crate) fn good() -> (String, String, String) {
-        (HOSTS.to_string(), SIGNALS.to_string(), REJECTIONS.to_string())
+        (
+            HOSTS.to_string(),
+            SIGNALS.to_string(),
+            REJECTIONS.to_string(),
+        )
     }
 }
 
@@ -584,7 +588,12 @@ mod tests {
     #[test]
     fn good_bodies_are_shown_and_projected() {
         let source = ScriptedFleet::new(Ok(good()));
-        let out = current(&source, &fleet(PathBuf::from("/k")), &FleetCache::new(), NOW);
+        let out = current(
+            &source,
+            &fleet(PathBuf::from("/k")),
+            &FleetCache::new(),
+            NOW,
+        );
         let value = render(&out);
         assert_eq!(value["state"], "shown");
         assert_eq!(value["hosts_total"], 2);
@@ -617,7 +626,12 @@ mod tests {
         let unknown = HOSTS.replace("\"online\"", "\"sleepy\"");
         let reason = REJECTIONS.replace("unknown_field", "made_up");
         let source = ScriptedFleet::new(Ok((unknown, bidi, reason)));
-        let out = current(&source, &fleet(PathBuf::from("/k")), &FleetCache::new(), NOW);
+        let out = current(
+            &source,
+            &fleet(PathBuf::from("/k")),
+            &FleetCache::new(),
+            NOW,
+        );
         let value = render(&out);
         assert_eq!(value["state"], "partial");
         assert_eq!(value["skipped"], 3);
@@ -628,9 +642,21 @@ mod tests {
 
     #[test]
     fn a_bad_body_dashes_the_panel() {
-        for body in ["[]", "{}", "{\"items\":{}}", "not json", "{\"items\":[],\"next_cursor\":7}"] {
-            let source = ScriptedFleet::new(Ok((body.to_string(), SIGNALS.into(), REJECTIONS.into())));
-            let out = current(&source, &fleet(PathBuf::from("/k")), &FleetCache::new(), NOW);
+        for body in [
+            "[]",
+            "{}",
+            "{\"items\":{}}",
+            "not json",
+            "{\"items\":[],\"next_cursor\":7}",
+        ] {
+            let source =
+                ScriptedFleet::new(Ok((body.to_string(), SIGNALS.into(), REJECTIONS.into())));
+            let out = current(
+                &source,
+                &fleet(PathBuf::from("/k")),
+                &FleetCache::new(),
+                NOW,
+            );
             let value = render(&out);
             assert_eq!(value["state"], "dashed", "{body}");
             assert_eq!(value["problem"], "fleet_rejected");
@@ -672,7 +698,11 @@ mod tests {
         assert_eq!(source.calls.load(Ordering::SeqCst), 2);
         let back = render(&current(&source, &pin, &cache, NOW - 200_000));
         assert_eq!(back["state"], "shown");
-        assert_eq!(source.calls.load(Ordering::SeqCst), 3, "a backward clock refetches");
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            3,
+            "a backward clock refetches"
+        );
     }
 
     #[test]
